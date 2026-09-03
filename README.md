@@ -1,9 +1,11 @@
 # ZMK SM_TD
 
-SM Tap-Dance for ZMK — a ZMK module port of the [QMK SM_TD](https://github.com/stasmarkin/sm_td) library. It makes
+SM Tap-Dance for ZMK — a ZMK module port of the [QMK SM_TD](https://github.com/stasmarkin/sm_td) library by
+Stanislav Markin (MIT license). It is based on the QMK `sm_td` state machine and makes
 Home Row Modifiers (HRMs) and Tap-Dance reliable during fast typing by analyzing key **releases** (not just presses).
 
-This is a clean adaptation of the MIT-licensed QMK `sm_td` state machine to the ZMK behavior / Zephyr event model.
+The state-machine logic is adapted from the MIT-licensed QMK `sm_td` to the ZMK behavior / Zephyr event model;
+attribution to the original author is preserved.
 
 ## Overview
 
