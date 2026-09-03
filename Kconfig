@@ -1,0 +1,41 @@
+menu "SM_TD Options"
+
+config ZMK_SM_TD_POOL_SIZE
+    int "Max concurrent active sm_td states"
+    default 10
+
+config ZMK_SM_TD_DEFAULT_TAP_TERM_MS
+    int "Default tap timeout (ms)"
+    default 200
+
+config ZMK_SM_TD_DEFAULT_SEQUENCE_TERM_MS
+    int "Default sequence timeout (ms)"
+    default 100
+
+config ZMK_SM_TD_DEFAULT_RELEASE_TERM_MS
+    int "Default release timeout (ms)"
+    default 50
+
+config ZMK_SM_TD_DYNAMIC_RELEASE
+    bool "Enable dynamic release term"
+    default y
+
+config ZMK_SM_TD_RELEASE_PERCENT
+    int "Dynamic release window percent (0=disabled)"
+    default 30
+
+config ZMK_SM_TD_AGGREGATE_TAPS
+    bool "Aggregate taps before resolving"
+    default n
+
+config ZMK_SM_TD_DEBUG
+    bool "Enable SM_TD debug logging"
+    default n
+
+endmenu
+
+DT_COMPAT_ZMK_BEHAVIOR_SM_TD := zmk,behavior-sm-td
+
+config ZMK_BEHAVIOR_SM_TD
+    bool
+    default $(dt_compat_enabled,$(DT_COMPAT_ZMK_BEHAVIOR_SM_TD))

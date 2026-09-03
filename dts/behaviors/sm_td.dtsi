@@ -1,0 +1,43 @@
+/* Copyright 2026 Stanislav Markin (https://github.com/stasmarkin)
+ * Copyright 2026 ZMK Contributors
+ *
+ * SPDX-License-Identifier: MIT
+ */
+
+#include <dt-bindings/zmk/behaviors.h>
+#include <dt-bindings/zmk/keys.h>
+#include <dt-bindings/zmk/sm_td.h>
+
+/ {
+    behaviors {
+#if ZMK_BEHAVIOR_OMIT(SM_TD_MT)
+        /omit-if-no-ref/
+#endif
+        sm_td_mt: sm_td_mod_tap {
+            compatible = "zmk,behavior-sm-td";
+            #binding-cells = <2>;
+            bindings = <&mt>, <&kp>;
+            tap-term-ms = <200>;
+            sequence-term-ms = <100>;
+            release-term-ms = <50>;
+            release-percent = <30>;
+            flavor = "balanced";
+            display-name = "SM Mod-Tap";
+        };
+
+#if ZMK_BEHAVIOR_OMIT(SM_TD_LT)
+        /omit-if-no-ref/
+#endif
+        sm_td_lt: sm_td_layer_tap {
+            compatible = "zmk,behavior-sm-td";
+            #binding-cells = <2>;
+            bindings = <&mo>, <&kp>;
+            tap-term-ms = <200>;
+            sequence-term-ms = <100>;
+            release-term-ms = <50>;
+            release-percent = <30>;
+            flavor = "tap-preferred";
+            display-name = "SM Layer-Tap";
+        };
+    };
+};

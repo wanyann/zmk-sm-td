@@ -1,0 +1,34 @@
+# Copyright (c) 2026 Stanislav Markin (https://github.com/stasmarkin)
+# SPDX-License-Identifier: MIT
+description: SM Tap-Dance Behavior
+compatible: "zmk,behavior-sm-td"
+include: two_param.yaml
+properties:
+  bindings:
+    type: phandle-array
+    required: true
+  tap-term-ms:
+    type: int
+    default: 200
+  sequence-term-ms:
+    type: int
+    default: 100
+  release-term-ms:
+    type: int
+    default: 50
+  release-percent:
+    type: int
+    default: 30
+  flavor:
+    type: string
+    enum:
+      - "balanced"
+      - "hold-preferred"
+      - "tap-preferred"
+    default: "balanced"
+  retro-tap:
+    type: boolean
+    default: false
+  aggregate-taps:
+    type: boolean
+    default: false
