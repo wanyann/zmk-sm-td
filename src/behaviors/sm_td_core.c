@@ -36,6 +36,9 @@
 /* Out-calls implemented by the behavior driver. */
 smtd_resolution smtd_driver_on_action(smtd_runtime *rt, uint32_t position, smtd_action action, uint8_t tap_count);
 void smtd_driver_emit_key(smtd_runtime *rt, uint32_t position, bool pressed, int64_t timestamp);
+/* Called whenever a resolution pass may have completed; the driver uses it to
+ * release captured position events once no instance is undecided anymore. */
+void smtd_driver_after_resolve(smtd_runtime *rt);
 
 /* ------------------------------------------------------------------ *
  *                          TIMEOUTS                                  *
@@ -76,6 +79,8 @@ void smtd_timeout_cb(struct k_work *work) {
     default:
         break;
     }
+
+    smtd_driver_after_resolve(rt);
 }
 
 static void smtd_schedule_timeout(smtd_runtime *rt, smtd_state *state, uint32_t ms) {
@@ -132,6 +137,12 @@ void smtd_reset_runtime(smtd_runtime *runtime) {
     }
     runtime->active_size = 0;
     runtime->bypass = false;
+    runtime->emitting = false;
+    runtime->releasing_captured = false;
+    runtime->captured_size = 0;
+    for (uint8_t i = 0; i < SMTD_CAPTURED_EVENTS_SIZE; i++) {
+        runtime->captured[i].used = false;
+    }
 }
 
 /* ------------------------------------------------------------------ *
@@ -189,12 +200,15 @@ void smtd_apply_to_stack(smtd_runtime *rt, uint8_t starting_idx, uint32_t positi
     }
 
     if (processed_state) {
+        smtd_driver_after_resolve(rt);
         return;
     }
     if (!pressed) {
+        smtd_driver_after_resolve(rt);
         return;
     }
     smtd_create_state(rt, position, pressed_time, released_time, pressed, tap_count);
+    smtd_driver_after_resolve(rt);
 }
 
 void smtd_create_state(smtd_runtime *rt, uint32_t position, int64_t pressed_time, int64_t released_time,
@@ -547,4 +561,39 @@ bool smtd_feature_enabled_default(const struct smtd_config *config, smtd_feature
 bool smtd_feature_enabled_or_default(const struct smtd_config *config, uint32_t position, smtd_feature feature) {
     (void)position;
     return smtd_feature_enabled_default(config, feature);
+}
+
+/* ------------------------------------------------------------------ *
+ *                      ZMK CAPTURE SUPPORT                            *
+ * ------------------------------------------------------------------ */
+
+bool smtd_has_undecided(smtd_runtime *rt) {
+    return rt->active_size > 0 && !rt->bypass && !rt->emitting;
+}
+
+bool smtd_owns_position(smtd_runtime *rt, uint32_t position) {
+    for (uint8_t i = 0; i < rt->active_size; i++) {
+        if (rt->active[i]->position == position) {
+            return true;
+        }
+    }
+    return false;
+}
+
+int smtd_capture_event(smtd_runtime *rt, uint32_t position, bool pressed) {
+    if (rt->captured_size >= SMTD_CAPTURED_EVENTS_SIZE) {
+        return -ENOMEM;
+    }
+    struct smtd_captured_event *ev = &rt->captured[rt->captured_size++];
+    ev->used = true;
+    ev->position = position;
+    ev->pressed = pressed;
+    return 0;
+}
+
+void smtd_capture_clear(smtd_runtime *rt) {
+    for (uint8_t i = 0; i < rt->captured_size; i++) {
+        rt->captured[i].used = false;
+    }
+    rt->captured_size = 0;
 }

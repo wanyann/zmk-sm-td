@@ -21,7 +21,6 @@
             sequence-term-ms = <100>;
             release-term-ms = <50>;
             release-percent = <30>;
-            flavor = "balanced";
             display-name = "SM Mod-Tap";
         };
 
@@ -36,7 +35,6 @@
             sequence-term-ms = <100>;
             release-term-ms = <50>;
             release-percent = <30>;
-            flavor = "tap-preferred";
             display-name = "SM Layer-Tap";
         };
     };

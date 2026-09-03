@@ -121,26 +121,43 @@ typedef struct {
 #define SMTD_POOL_SIZE 10
 #endif
 
-/* Global config shared by all instances. Filled by the behavior driver. */
+/* Per-instance config. Filled by the behavior driver from devicetree. */
 struct smtd_config {
     uint32_t tap_term_ms;
     uint32_t sequence_term_ms;
     uint32_t release_term_ms;
     uint32_t release_percent;
     bool aggregate_taps;
-    bool retro_tap;
-    /* Locality: the behavior that resolves a tap must run on the central side. */
-    struct zmk_behavior_binding bindings[2];
 };
+
+/* A position_state_changed event held back while an sm_td key is undecided,
+ * re-raised once the decision is made. Mirrors the ZMK hold-tap capture. */
+struct smtd_captured_event {
+    bool used;
+    uint32_t position;
+    bool pressed;
+};
+
+#ifndef SMTD_CAPTURED_EVENTS_SIZE
+#define SMTD_CAPTURED_EVENTS_SIZE 16
+#endif
 
 typedef struct {
     smtd_state pool[SMTD_POOL_SIZE];
     smtd_state *active[SMTD_POOL_SIZE];
     uint8_t active_size;
     bool bypass;
+    /* Set while the driver is emitting a resolved hold/tap binding, so the
+     * listener ignores the re-entrant position events (mirrors QMK bypass). */
+    bool emitting;
     const struct smtd_config *config;
     /* Owning behavior device, so the driver can reach its config/API. */
     const struct device *device;
+    /* Events captured while this instance had undecided states. */
+    struct smtd_captured_event captured[SMTD_CAPTURED_EVENTS_SIZE];
+    uint8_t captured_size;
+    /* Set while captured events are being re-raised, to avoid recursion. */
+    bool releasing_captured;
 } smtd_runtime;
 
 /* ************************************* *
@@ -209,3 +226,40 @@ bool smtd_feature_enabled_default(const struct smtd_config *config, smtd_feature
 
 /* Default timeout callbacks (implemented in sm_td_core.c). */
 void smtd_timeout_cb(struct k_work *work);
+
+/* ------------------------------------------------------------------ *
+ *              DRIVER OUT-CALLS (implemented in behavior_sm_td.c)      *
+ * ------------------------------------------------------------------ */
+
+/* Called by core on each action (touch, tap, hold, release). Returns
+ * UNHANDLED to let the core invoke emit_key instead. */
+smtd_resolution smtd_driver_on_action(smtd_runtime *rt, uint32_t position,
+                                      smtd_action action, uint8_t tap_count);
+
+/* Emit a tap press or release via the tap sub-behavior. */
+void smtd_driver_emit_key(smtd_runtime *rt, uint32_t position, bool pressed,
+                          int64_t timestamp);
+
+/* Called by core after resolving hold/tap. Checks if any instance still has
+ * undecided states; if not, re-raises all captured events. */
+void smtd_driver_after_resolve(smtd_runtime *rt);
+
+/* ------------------------------------------------------------------ *
+ *                 ZMK CAPTURE SUPPORT (implemented in core)           *
+ * ------------------------------------------------------------------ */
+
+/* True when the instance has any active, not-yet-fully-resolved state. */
+bool smtd_has_undecided(smtd_runtime *rt);
+
+/* True when `position` is currently tracked as one of this instance's own
+ * sm_td keys (so the listener must let it bubble to the keymap). */
+bool smtd_owns_position(smtd_runtime *rt, uint32_t position);
+
+/* Store a captured position event for later re-raising. Returns -ENOMEM when
+ * the capture buffer is full. */
+int smtd_capture_event(smtd_runtime *rt, uint32_t position, bool pressed);
+
+/* Re-raise all captured events. `release_fn` is invoked by the core whenever a
+ * captured event is ready to be re-raised (keeps the driver decoupled from
+ * raising when it wants). Returns the number of events released. */
+void smtd_capture_clear(smtd_runtime *rt);

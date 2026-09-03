@@ -5,7 +5,7 @@ compatible: "zmk,behavior-sm-td"
 include: two_param.yaml
 properties:
   bindings:
-    type: phandle-array
+    type: phandles
     required: true
   tap-term-ms:
     type: int
@@ -19,16 +19,6 @@ properties:
   release-percent:
     type: int
     default: 30
-  flavor:
-    type: string
-    enum:
-      - "balanced"
-      - "hold-preferred"
-      - "tap-preferred"
-    default: "balanced"
-  retro-tap:
-    type: boolean
-    default: false
   aggregate-taps:
     type: boolean
     default: false
