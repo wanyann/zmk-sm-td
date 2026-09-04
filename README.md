@@ -47,7 +47,7 @@ Include the convenience behavior instances, then use the `SMTD_MT` / `SMTD_LT` m
 ```dts
 #include <behaviors.dtsi>
 #include <dt-bindings/zmk/keys.h>
-#include <sm_td.dtsi>
+#include <behaviors/sm_td.dtsi>
 
 / {
     keymap {

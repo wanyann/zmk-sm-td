@@ -288,13 +288,21 @@ static int on_position_state_changed(const zmk_event_t *eh) {
     }
 
     for (uint8_t i = 0; i < instance_count; i++) {
+        /* Only instances with pending state need to track this "other" key,
+         * which also avoids exhausting every instance's state pool on a roll. */
+        if (!smtd_has_undecided(&instances[i]->runtime)) {
+            continue;
+        }
         smtd_process_event(&instances[i]->runtime, ev->position, ev->timestamp, ev->timestamp,
                            ev->state);
     }
     smtd_driver_after_resolve(NULL);
 
     if (!smtd_capture_store(ev)) {
-        LOG_ERR("sm_td capture buffer full");
+        /* Buffer full: dropping the key is worse than resolving it immediately,
+         * so let the event continue to the keymap instead of capturing it. */
+        LOG_ERR("sm_td capture buffer full, bubbling event");
+        return ZMK_EV_EVENT_BUBBLE;
     }
     return ZMK_EV_EVENT_CAPTURED;
 }

@@ -139,7 +139,7 @@ struct smtd_captured_event {
 };
 
 #ifndef SMTD_CAPTURED_EVENTS_SIZE
-#define SMTD_CAPTURED_EVENTS_SIZE 16
+#define SMTD_CAPTURED_EVENTS_SIZE 32
 #endif
 
 typedef struct {
