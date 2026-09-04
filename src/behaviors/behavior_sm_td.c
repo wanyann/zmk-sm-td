@@ -74,7 +74,7 @@ static uint8_t instance_count = 0;
  * instance is undecided anymore. Stored globally (not per-instance) so a
  * single physical key event is released exactly once. */
 struct captured_event {
-    struct zmk_position_state_changed data;
+    struct zmk_position_state_changed_event data;
 };
 
 static struct captured_event captured[CAPTURED_MAX];
@@ -142,7 +142,7 @@ static bool smtd_capture_store(const struct zmk_position_state_changed *ev) {
         return false;
     }
     uint8_t tail = (captured_head + captured_count) % CAPTURED_MAX;
-    captured[tail].data = *ev;
+    captured[tail].data = copy_raised_zmk_position_state_changed(ev);
     captured_count++;
     return true;
 }
@@ -301,6 +301,35 @@ static int on_position_state_changed(const zmk_event_t *eh) {
 
 ZMK_LISTENER(sm_td_listener, on_position_state_changed);
 ZMK_SUBSCRIPTION(sm_td_listener, zmk_position_state_changed);
+
+/* ------------------------------------------------------------------ *
+ *              LISTENER ORDERING DEBUG (temporary)                    *
+ * ------------------------------------------------------------------ */
+
+extern const struct zmk_listener zmk_listener_keymap;
+extern struct zmk_event_subscription __event_subscriptions_start[];
+extern struct zmk_event_subscription __event_subscriptions_end[];
+
+static void smtd_dump_subscription_order(void) {
+    int sm_idx = -1;
+    int km_idx = -1;
+    long i = 0;
+    for (struct zmk_event_subscription *sub = __event_subscriptions_start;
+         sub != __event_subscriptions_end; sub++, i++) {
+        if (sub->event_type != &zmk_event_zmk_position_state_changed) {
+            continue;
+        }
+        if (sub->listener == &zmk_listener_sm_td) {
+            sm_idx = (int)i;
+        } else if (sub->listener == &zmk_listener_keymap) {
+            km_idx = (int)i;
+        }
+    }
+    LOG_INF("SM_TD listener idx=%d, keymap idx=%d -> sm_td runs %s keymap", sm_idx, km_idx,
+            (sm_idx >= 0 && km_idx >= 0 && sm_idx < km_idx) ? "BEFORE" : "AFTER");
+}
+
+SYS_INIT(smtd_dump_subscription_order, POST_KERNEL, CONFIG_KERNEL_INIT_PRIORITY_DEFAULT);
 
 /* ------------------------------------------------------------------ *
  *                        INIT & INSTANCES                            *
