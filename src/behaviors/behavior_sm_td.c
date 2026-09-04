@@ -331,7 +331,7 @@ static void smtd_dump_subscription_order(void) {
         if (sub->event_type != &zmk_event_zmk_position_state_changed) {
             continue;
         }
-        if (sub->listener == &zmk_listener_sm_td) {
+        if (sub->listener == &zmk_listener_sm_td_listener) {
             sm_idx = (int)i;
         } else if (sub->listener == &zmk_listener_keymap) {
             km_idx = (int)i;
