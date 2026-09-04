@@ -142,7 +142,7 @@ struct smtd_captured_event {
 #define SMTD_CAPTURED_EVENTS_SIZE 32
 #endif
 
-typedef struct {
+struct smtd_runtime {
     smtd_state pool[SMTD_POOL_SIZE];
     smtd_state *active[SMTD_POOL_SIZE];
     uint8_t active_size;
@@ -158,7 +158,7 @@ typedef struct {
     uint8_t captured_size;
     /* Set while captured events are being re-raised, to avoid recursion. */
     bool releasing_captured;
-} smtd_runtime;
+};
 
 /* ************************************* *
  *           PUBLIC FUNCTIONS            *
