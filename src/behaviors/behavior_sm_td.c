@@ -84,6 +84,10 @@ static uint8_t captured_count = 0;
 static bool releasing_captured = false;
 static bool emitting_binding = false;
 
+/* Forward declaration of our own listener, so smtd_capture_release can re-raise
+ * captured events via ZMK_EVENT_RAISE_AT before ZMK_LISTENER is reached below. */
+extern const struct zmk_listener zmk_listener_sm_td_listener;
+
 static inline void emit_guard(void) { emitting_binding = true; }
 static inline void emit_unguard(void) { emitting_binding = false; }
 
