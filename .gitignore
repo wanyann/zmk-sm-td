@@ -1,5 +1,4 @@
 build/
-zephyr/
 *.uf2
 *.hex
 *.bin
