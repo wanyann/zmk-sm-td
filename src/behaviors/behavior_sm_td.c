@@ -22,17 +22,20 @@
 
 #define DT_DRV_COMPAT zmk_behavior_sm_td
 
+#define LOG_LEVEL CONFIG_SM_TD_LOG_LEVEL
 #include <string.h>
 #include <zephyr/device.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
-LOG_MODULE_REGISTER(sm_td, CONFIG_ZMK_LOG_LEVEL);
+LOG_MODULE_REGISTER(sm_td);
 
 #include <drivers/behavior.h>
 #include <zmk/behavior.h>
+#include <zmk/behavior_queue.h>
 #include <zmk/keymap.h>
 #include <zmk/event_manager.h>
 #include <zmk/events/position_state_changed.h>
+#include <zmk/workqueue.h>
 
 #include <zmk-sm-td/sm_td.h>
 
@@ -84,12 +87,210 @@ static uint8_t captured_count = 0;
 static bool releasing_captured = false;
 static bool emitting_binding = false;
 
+/* Re-entrancy guards: the ZMK combo subsystem synchronously re-raises our own
+ * key's position events (combo_timeout_handler -> release_pressed_keys ->
+ * ZMK_EVENT_RELEASE -> keymap -> on_sm_td_binding_*). Without a guard, that
+ * cascade can re-enter the state machine unboundedly and freeze the keyboard.
+ * own_key_depth caps how deep a single top-level dispatch may nest, and the
+ * fail-safe makes sure we never spin forever even if the call stack hides the
+ * loop. */
+#define OWN_KEY_DEPTH_MAX 4
+static uint8_t own_key_depth = 0;
+static bool own_key_guard_failed = false;
+
+static bool own_key_enter(void);
+static void own_key_leave(void);
+
 /* Forward declaration of our own listener, so smtd_capture_release can re-raise
  * captured events via ZMK_EVENT_RAISE_AT before ZMK_LISTENER is reached below. */
 extern const struct zmk_listener zmk_listener_sm_td_listener;
 
 static inline void emit_guard(void) { emitting_binding = true; }
 static inline void emit_unguard(void) { emitting_binding = false; }
+
+/* ------------------------------------------------------------------ *
+ *                 ASYNC SUB-BEHAVIOR EMISSION                         *
+ * ------------------------------------------------------------------ *
+ * Sub-behavior emits are deferred to a dedicated k_work so they run in
+ * the system work queue instead of synchronously nested inside whatever
+ * cascade raised us (notably ZMK combo's release_pressed_keys re-raise of
+ * our own key). That fully decouples the emitting invoke_binding from the
+ * combo cascade, which previously re-entered the keymap for the same
+ * physical position and froze the keyboard. FIFO keeps press->release
+ * ordering intact. */
+
+#define SMTD_EMIT_POOL_SIZE 4
+struct smtd_emit_item {
+    const char *dev_name;
+    uint32_t param;
+    uint32_t position;
+    int64_t timestamp;
+    bool press;
+};
+
+static struct smtd_emit_item smtd_emit_pool[SMTD_EMIT_POOL_SIZE];
+static uint8_t smtd_emit_head = 0;
+static uint8_t smtd_emit_count = 0;
+
+static void smtd_emit_work_handler(struct k_work *work);
+static K_WORK_DEFINE(smtd_emit_work, smtd_emit_work_handler);
+
+static void smtd_emit_work_handler(struct k_work *work) {
+    ARG_UNUSED(work);
+    LOG_DBG("sm_td emit work start (queued=%u)", smtd_emit_count);
+
+    while (smtd_emit_count > 0) {
+        struct smtd_emit_item *it = &smtd_emit_pool[smtd_emit_head];
+        smtd_emit_head = (smtd_emit_head + 1) % SMTD_EMIT_POOL_SIZE;
+        smtd_emit_count--;
+
+        struct zmk_behavior_binding bb = {
+            .behavior_dev = it->dev_name,
+            .param1 = it->param,
+            .param2 = 0,
+        };
+        struct zmk_behavior_binding_event event = {
+            .position = it->position,
+            .timestamp = it->timestamp,
+        };
+
+        emit_guard();
+        zmk_behavior_queue_add(&event, bb, it->press, 0);
+        emit_unguard();
+    }
+
+    LOG_WRN("sm_td emit work handler DONE");
+}
+
+static int smtd_enqueue_emit(const char *dev_name, uint32_t param, uint32_t position,
+                             bool pressed, int64_t timestamp) {
+    if (smtd_emit_count >= SMTD_EMIT_POOL_SIZE) {
+        LOG_ERR("sm_td emit pool full, dropping dev=%s pos=%u", dev_name, position);
+        return -ENOMEM;
+    }
+    uint8_t tail = (smtd_emit_head + smtd_emit_count) % SMTD_EMIT_POOL_SIZE;
+    struct smtd_emit_item *it = &smtd_emit_pool[tail];
+    it->dev_name = dev_name;
+    it->param = param;
+    it->position = position;
+    it->timestamp = timestamp;
+    it->press = pressed;
+    smtd_emit_count++;
+
+    LOG_DBG("sm_td enqueue emit dev=%s pos=%u press=%d count=%u", dev_name, position, pressed,
+            smtd_emit_count);
+    k_work_submit(&smtd_emit_work);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ *
+ *                 ASYNC OWN-KEY STATE MACHINE                         *
+ * ------------------------------------------------------------------ *
+ * The own sm_td key's press/release are NOT processed inline in the
+ * binding handlers. They are enqueued here and driven by a dedicated work
+ * item on the ZMK low-priority work queue. This fully decouples the state
+ * machine (and everything it triggers, including the emit) from whatever
+ * cascade raised us -- critically ZMK combo's release_pressed_keys re-raise
+ * of our own key -- which synchronously re-entered the keymap for the same
+ * physical position and froze the keyboard. FIFO keeps press->release
+ * ordering intact. */
+
+#define SMTD_OWN_POOL_SIZE 8
+struct smtd_own_item {
+    struct behavior_sm_td_data *data;
+    uint32_t hold_param;
+    uint32_t tap_param;
+    uint8_t binding_layer;
+    uint32_t position;
+    int64_t timestamp;
+    bool pressed;
+};
+
+static struct smtd_own_item smtd_own_pool[SMTD_OWN_POOL_SIZE];
+static uint8_t smtd_own_head = 0;
+static uint8_t smtd_own_count = 0;
+
+static void smtd_own_work_handler(struct k_work *work);
+static K_WORK_DEFINE(smtd_own_work, smtd_own_work_handler);
+
+static void smtd_own_work_handler(struct k_work *work) {
+    ARG_UNUSED(work);
+
+    while (smtd_own_count > 0) {
+        struct smtd_own_item *it = &smtd_own_pool[smtd_own_head];
+        smtd_own_head = (smtd_own_head + 1) % SMTD_OWN_POOL_SIZE;
+        smtd_own_count--;
+
+        struct behavior_sm_td_data *data = it->data;
+        data->hold_param = it->hold_param;
+        data->tap_param = it->tap_param;
+        data->binding_layer = it->binding_layer;
+
+        /* Guard the state machine against re-entering (defense in depth;
+         * in this decoupled context re-entry is not expected). */
+        if (!own_key_enter()) {
+            LOG_DBG("sm_td own-key work suppressed pos=%u", it->position);
+            continue;
+        }
+
+        smtd_process_event(&data->runtime, it->position, it->timestamp, it->timestamp, it->pressed);
+        smtd_driver_after_resolve(&data->runtime);
+
+        own_key_leave();
+    }
+
+    LOG_WRN("sm_td own-work handler DONE");
+}
+
+static int smtd_enqueue_own(struct behavior_sm_td_data *data, uint32_t hold_param,
+                            uint32_t tap_param, uint8_t binding_layer, uint32_t position,
+                            int64_t timestamp, bool pressed) {
+    if (smtd_own_count >= SMTD_OWN_POOL_SIZE) {
+        LOG_ERR("sm_td own-key pool full, dropping pos=%u", position);
+        return -ENOMEM;
+    }
+    uint8_t tail = (smtd_own_head + smtd_own_count) % SMTD_OWN_POOL_SIZE;
+    struct smtd_own_item *it = &smtd_own_pool[tail];
+    it->data = data;
+    it->hold_param = hold_param;
+    it->tap_param = tap_param;
+    it->binding_layer = binding_layer;
+    it->position = position;
+    it->timestamp = timestamp;
+    it->pressed = pressed;
+    smtd_own_count++;
+
+    k_work_submit_to_queue(&k_sys_work_q, &smtd_own_work);
+    return 0;
+}
+
+/* Returns true if we are allowed to drive the state machine for an own key
+ * from within the current (possibly combo-re-raised) dispatch. If the depth
+ * guard trips we latch the failure and suppress all further own-key work. */
+static bool own_key_enter(void) {
+    if (own_key_guard_failed) {
+        return false;
+    }
+    if (own_key_depth >= OWN_KEY_DEPTH_MAX) {
+        LOG_ERR("sm_td own-key processing re-entered too deep (combo loop), suppressing");
+        own_key_guard_failed = true;
+        return false;
+    }
+    own_key_depth++;
+    return true;
+}
+
+static void own_key_leave(void) {
+    if (own_key_depth > 0) {
+        own_key_depth--;
+    }
+    /* Re-arm the guard once the whole (possibly combo-raised) cascade has
+     * unwound, so a transient re-entry only suppresses that one episode and
+     * does not permanently disable the behavior. */
+    if (own_key_depth == 0) {
+        own_key_guard_failed = false;
+    }
+}
 
 static void smtd_register_instance(struct behavior_sm_td_data *data) {
     if (instance_count >= MAX_INSTANCES) {
@@ -148,6 +349,7 @@ static bool smtd_capture_store(const struct zmk_position_state_changed *ev) {
     uint8_t tail = (captured_head + captured_count) % CAPTURED_MAX;
     captured[tail].data = copy_raised_zmk_position_state_changed(ev);
     captured_count++;
+    LOG_DBG("capture store pos=%u state=%d buffered=%u", ev->position, ev->state, captured_count);
     return true;
 }
 
@@ -156,14 +358,18 @@ static void smtd_capture_release(void) {
         return;
     }
     releasing_captured = true;
+    LOG_DBG("== capture release begin (buffered=%u) ==", captured_count);
     while (captured_count > 0) {
         struct captured_event ev = captured[captured_head];
         captured_head = (captured_head + 1) % CAPTURED_MAX;
         captured_count--;
+        LOG_DBG("capture re-raise pos=%u state=%d remaining=%u", ev.data.data.position,
+                ev.data.data.state, captured_count);
         /* Re-raise at our own listener: any new sm_td work will re-capture
          * where appropriate, otherwise the event flows on to the keymap. */
         ZMK_EVENT_RAISE_AT(ev.data, sm_td_listener);
     }
+    LOG_DBG("== capture release end ==");
     releasing_captured = false;
 }
 
@@ -177,6 +383,25 @@ static int smtd_invoke(struct behavior_sm_td_data *data, uint8_t which, uint32_t
     const char *dev_name = (which == 0) ? cfg->hold_dev_name : cfg->tap_dev_name;
     uint32_t param = (which == 0) ? data->hold_param : data->tap_param;
 
+    /* Defer the emit to our own work item so zmk_behavior_invoke_binding runs
+     * in the system work queue, fully outside whatever cascade raised us (e.g.
+     * the combo subsystem's release_pressed_keys re-raise of our own key). That
+     * decoupling avoids the deep synchronous nesting that froze the keyboard. */
+    return smtd_enqueue_emit(dev_name, param, position, pressed, timestamp);
+}
+
+/* Synchronous variant of smtd_invoke: drains the behavior queue inline, in the
+ * current event dispatch. Only used when an external keypress forces an
+ * undecided sm_td state to HOLD, so the hold binding (modifier) is registered
+ * before the external key reaches the keymap. Safe here because the invoked
+ * sub-behavior (&kp) neither re-enters the keymap for our own position nor
+ * raises position events, so no combo re-raise cascade can occur. */
+static int smtd_invoke_sync(struct behavior_sm_td_data *data, uint8_t which, uint32_t position,
+                            bool pressed, int64_t timestamp) {
+    const struct behavior_sm_td_config *cfg = data->runtime.device->config;
+    const char *dev_name = (which == 0) ? cfg->hold_dev_name : cfg->tap_dev_name;
+    uint32_t param = (which == 0) ? data->hold_param : data->tap_param;
+
     struct zmk_behavior_binding bb = {
         .behavior_dev = dev_name,
         .param1 = param,
@@ -184,14 +409,14 @@ static int smtd_invoke(struct behavior_sm_td_data *data, uint8_t which, uint32_t
     };
     struct zmk_behavior_binding_event event = {
         .position = position,
-        .layer = data->binding_layer,
         .timestamp = timestamp,
     };
 
+    LOG_DBG("sm_td sync emit dev=%s pos=%u press=%d", dev_name, position, pressed);
     emit_guard();
-    int ret = zmk_behavior_invoke_binding(&bb, event, pressed);
+    zmk_behavior_queue_add(&event, bb, pressed, 0);
     emit_unguard();
-    return ret;
+    return 0;
 }
 
 /* ------------------------------------------------------------------ *
@@ -215,7 +440,11 @@ smtd_resolution smtd_driver_on_action(smtd_runtime *rt, uint32_t position, smtd_
         smtd_invoke(data, 1, position, false, k_uptime_get());
         return SMTD_RESOLUTION_DETERMINED;
     case SMTD_ACTION_HOLD:
-        smtd_invoke(data, 0, position, true, k_uptime_get());
+        if (rt->sync_emit) {
+            smtd_invoke_sync(data, 0, position, true, k_uptime_get());
+        } else {
+            smtd_invoke(data, 0, position, true, k_uptime_get());
+        }
         return SMTD_RESOLUTION_DETERMINED;
     case SMTD_ACTION_RELEASE:
         smtd_invoke(data, 0, position, false, k_uptime_get());
@@ -249,8 +478,12 @@ static int on_sm_td_binding_pressed(struct zmk_behavior_binding *binding,
     data->tap_param = binding->param2;
     data->binding_layer = event.layer;
 
+    if (!own_key_enter()) {
+        return ZMK_BEHAVIOR_OPAQUE;
+    }
     smtd_process_event(&data->runtime, event.position, event.timestamp, event.timestamp, true);
     smtd_driver_after_resolve(&data->runtime);
+    own_key_leave();
     return ZMK_BEHAVIOR_OPAQUE;
 }
 
@@ -259,8 +492,12 @@ static int on_sm_td_binding_released(struct zmk_behavior_binding *binding,
     const struct device *dev = zmk_behavior_get_binding(binding->behavior_dev);
     struct behavior_sm_td_data *data = dev->data;
 
+    if (!own_key_enter()) {
+        return ZMK_BEHAVIOR_OPAQUE;
+    }
     smtd_process_event(&data->runtime, event.position, event.timestamp, event.timestamp, false);
     smtd_driver_after_resolve(&data->runtime);
+    own_key_leave();
     return ZMK_BEHAVIOR_OPAQUE;
 }
 
@@ -285,30 +522,24 @@ static int on_position_state_changed(const zmk_event_t *eh) {
         return ZMK_EV_EVENT_BUBBLE;
     }
 
-    /* "Other" key. Capture it (and feed the state machines) while any
-     * instance is still undecided, otherwise let it flow through normally. */
+    /* "Other" key. Commit any genuinely undecided sm_td state (hold) so this
+     * key does not wait behind it, then let the key flow straight to the
+     * keymap. External keys are never captured nor added to the state pool:
+     * giving them states made their own tap-terms fire and emit sm_td's
+     * hold binding (stuck modifiers) and orphaned their keymap events. */
     if (!smtd_any_undecided()) {
         return ZMK_EV_EVENT_BUBBLE;
     }
 
     for (uint8_t i = 0; i < instance_count; i++) {
-        /* Only instances with pending state need to track this "other" key,
-         * which also avoids exhausting every instance's state pool on a roll. */
         if (!smtd_has_undecided(&instances[i]->runtime)) {
             continue;
         }
-        smtd_process_event(&instances[i]->runtime, ev->position, ev->timestamp, ev->timestamp,
-                           ev->state);
+        smtd_other_key_down(&instances[i]->runtime, ev->position);
     }
     smtd_driver_after_resolve(NULL);
 
-    if (!smtd_capture_store(ev)) {
-        /* Buffer full: dropping the key is worse than resolving it immediately,
-         * so let the event continue to the keymap instead of capturing it. */
-        LOG_ERR("sm_td capture buffer full, bubbling event");
-        return ZMK_EV_EVENT_BUBBLE;
-    }
-    return ZMK_EV_EVENT_CAPTURED;
+    return ZMK_EV_EVENT_BUBBLE;
 }
 
 ZMK_LISTENER(sm_td_listener, on_position_state_changed);
@@ -331,7 +562,7 @@ static void smtd_dump_subscription_order(void) {
         if (sub->event_type != &zmk_event_zmk_position_state_changed) {
             continue;
         }
-        if (sub->listener == &zmk_listener_sm_td) {
+        if (sub->listener == &zmk_listener_sm_td_listener) {
             sm_idx = (int)i;
         } else if (sub->listener == &zmk_listener_keymap) {
             km_idx = (int)i;

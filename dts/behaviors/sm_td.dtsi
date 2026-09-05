@@ -16,7 +16,7 @@
         sm_td_mt: sm_td_mod_tap {
             compatible = "zmk,behavior-sm-td";
             #binding-cells = <2>;
-            bindings = <&mt>, <&kp>;
+            bindings = <&kp>, <&kp>;
             tap-term-ms = <200>;
             sequence-term-ms = <100>;
             release-term-ms = <50>;

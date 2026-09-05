@@ -28,6 +28,10 @@
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 
+#define LOG_LEVEL CONFIG_SM_TD_LOG_LEVEL
+#include <zephyr/logging/log.h>
+LOG_MODULE_DECLARE(sm_td);
+
 #include <zmk/behavior.h>
 #include <zmk/keymap.h>
 
@@ -39,6 +43,41 @@ void smtd_driver_emit_key(smtd_runtime *rt, uint32_t position, bool pressed, int
 /* Called whenever a resolution pass may have completed; the driver uses it to
  * release captured position events once no instance is undecided anymore. */
 void smtd_driver_after_resolve(smtd_runtime *rt);
+
+/* ------------------------------------------------------------------ *
+ *                        DEBUG HELPERS                               *
+ * ------------------------------------------------------------------ */
+
+static const char *smtd_stage_name(smtd_stage stage) {
+    switch (stage) {
+    case SMTD_STAGE_NONE: return "NONE";
+    case SMTD_STAGE_TOUCH: return "TOUCH";
+    case SMTD_STAGE_SEQUENCE: return "SEQ";
+    case SMTD_STAGE_HOLD: return "HOLD";
+    case SMTD_STAGE_TOUCH_RELEASE: return "T_REL";
+    case SMTD_STAGE_HOLD_RELEASE: return "H_REL";
+    }
+    return "?";
+}
+
+static const char *smtd_action_name(smtd_action action) {
+    switch (action) {
+    case SMTD_ACTION_TOUCH: return "TOUCH";
+    case SMTD_ACTION_TAP: return "TAP";
+    case SMTD_ACTION_HOLD: return "HOLD";
+    case SMTD_ACTION_RELEASE: return "RELEASE";
+    }
+    return "?";
+}
+
+static void smtd_log_state(const struct smtd_runtime *rt, const smtd_state *state, const char *tag) {
+    if (state == NULL) {
+        LOG_DBG("[%p] %s: <null>", (const void *)rt, tag);
+        return;
+    }
+    LOG_DBG("[%p] %s pos=%u idx=%u/%u stage=%s", (const void *)rt, tag, state->position, state->idx,
+            rt->active_size, smtd_stage_name(state->stage));
+}
 
 /* ------------------------------------------------------------------ *
  *                          TIMEOUTS                                  *
@@ -56,6 +95,8 @@ void smtd_timeout_cb(struct k_work *work) {
         return;
     }
     t->active = false;
+
+    smtd_log_state(rt, state, "timeout");
 
     switch (state->stage) {
     case SMTD_STAGE_TOUCH:
@@ -131,13 +172,17 @@ void smtd_reset_runtime(smtd_runtime *runtime) {
         if (runtime->pool[i].timeout.active) {
             k_work_cancel_delayable(&runtime->pool[i].timeout.work);
         }
-        runtime->pool[i].timeout.work = (struct k_work_delayable){0};
+        k_work_init_delayable(&runtime->pool[i].timeout.work, smtd_timeout_cb);
+        runtime->pool[i].timeout.active = false;
+        runtime->pool[i].timeout.runtime = NULL;
+        runtime->pool[i].timeout.owner = NULL;
         smtd_reset_state(&runtime->pool[i]);
         runtime->active[i] = NULL;
     }
     runtime->active_size = 0;
     runtime->bypass = false;
     runtime->emitting = false;
+    runtime->sync_emit = false;
     runtime->releasing_captured = false;
     runtime->captured_size = 0;
     for (uint8_t i = 0; i < SMTD_CAPTURED_EVENTS_SIZE; i++) {
@@ -171,6 +216,8 @@ void smtd_apply_to_stack(smtd_runtime *rt, uint8_t starting_idx, uint32_t positi
         smtd_apply_event(rt, is_state_key, state, position, pressed_time, released_time, pressed, tap_count);
 
         if (state->stage == SMTD_STAGE_NONE) {
+            LOG_DBG("[%p] apply_to_stack: pos=%u resolved, reprocess @i=%u (active_size=%u)", (const void *)rt,
+                    position, i, rt->active_size);
             if (i > 0) {
                 i--;
             }
@@ -178,7 +225,22 @@ void smtd_apply_to_stack(smtd_runtime *rt, uint8_t starting_idx, uint32_t positi
     }
 
     uint8_t idx = rt->active_size;
+    uint8_t guard_iterations = 0;
     while (idx > 0) {
+        /* Defensive: if a stage->NONE removal ever fails to shrink
+         * active_size (e.g. a MISMATCH under a combo re-raise), this loop
+         * could spin forever. Cap the number of passes and bail out. */
+        if (++guard_iterations > (SMTD_POOL_SIZE * 4)) {
+            LOG_ERR("[%p] apply_to_stack: iteration guard tripped, force resolving active stack "
+                    "(active_size=%u)",
+                    (const void *)rt, rt->active_size);
+            for (uint8_t k = 0; k < rt->active_size; k++) {
+                smtd_state *s = rt->active[k];
+                smtd_handle_action(rt, s, SMTD_ACTION_TAP);
+                smtd_apply_stage(rt, s, SMTD_STAGE_NONE);
+            }
+            break;
+        }
         smtd_state *state = rt->active[idx - 1];
         if (state->stage == SMTD_STAGE_TOUCH_RELEASE) {
             smtd_handle_action(rt, state, SMTD_ACTION_TAP);
@@ -374,6 +436,13 @@ void smtd_apply_stage(smtd_runtime *rt, smtd_state *state, smtd_stage next_stage
             }
             rt->active_size--;
             rt->active[rt->active_size] = NULL;
+            LOG_DBG("[%p] stage->NONE removed pos=%u idx=%u, active_size=%u", (const void *)rt,
+                    state->position, state->idx, rt->active_size);
+        } else {
+            LOG_ERR("[%p] stage->NONE pos=%u idx=%u MISMATCH vs active_size=%u (rt->active[%u]=%p state=%p)",
+                    (const void *)rt, state->position, state->idx, rt->active_size, state->idx,
+                    (state->idx < rt->active_size) ? (void *)rt->active[state->idx] : (void *)NULL,
+                    (const void *)state);
         }
         smtd_reset_state(state);
         break;
@@ -425,6 +494,9 @@ void smtd_handle_action(smtd_runtime *rt, smtd_state *state, smtd_action action)
         return;
     }
 
+    LOG_DBG("[%p] action: pos=%u action=%s idx=%u/%u req=%d done=%d", (const void *)rt, state->position,
+            smtd_action_name(action), state->idx, rt->active_size, state->action_required,
+            state->action_performed);
     smtd_resolution resolution_before = state->resolution;
     smtd_execute_action(rt, state, action);
     state->action_performed = action;
@@ -567,8 +639,42 @@ bool smtd_feature_enabled_or_default(const struct smtd_config *config, uint32_t 
  *                      ZMK CAPTURE SUPPORT                            *
  * ------------------------------------------------------------------ */
 
+void smtd_other_key_down(smtd_runtime *rt, uint32_t position) {
+    (void)position;
+    for (uint8_t i = 0; i < rt->active_size; i++) {
+        smtd_state *state = rt->active[i];
+        if (state->resolution != SMTD_RESOLUTION_UNCERTAIN) {
+            continue;
+        }
+        if (state->stage == SMTD_STAGE_TOUCH) {
+            /* An external keypress while this key is still undecided means the
+             * user is holding it to use a modifier: commit to hold immediately
+             * so the external key can flow straight through to the keymap.
+             * Emit synchronously: the modifier must be registered before the
+             * external key's own keymap handling in the same event dispatch,
+             * otherwise the letter is reported without it. */
+            LOG_DBG("[%p] external press resolves pos=%u to HOLD", (const void *)rt, state->position);
+            rt->sync_emit = true;
+            smtd_apply_stage(rt, state, SMTD_STAGE_HOLD);
+            smtd_handle_action(rt, state, SMTD_ACTION_HOLD);
+            rt->sync_emit = false;
+        } else if (state->stage == SMTD_STAGE_SEQUENCE) {
+            /* A later keypress confirms the tap; drop the pending state. */
+            smtd_apply_stage(rt, state, SMTD_STAGE_NONE);
+        }
+    }
+}
+
 bool smtd_has_undecided(smtd_runtime *rt) {
-    return rt->active_size > 0 && !rt->bypass && !rt->emitting;
+    if (rt->bypass || rt->emitting) {
+        return false;
+    }
+    for (uint8_t i = 0; i < rt->active_size; i++) {
+        if (rt->active[i]->resolution == SMTD_RESOLUTION_UNCERTAIN) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool smtd_owns_position(smtd_runtime *rt, uint32_t position) {

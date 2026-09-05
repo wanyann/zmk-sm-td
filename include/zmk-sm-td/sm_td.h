@@ -150,6 +150,12 @@ struct smtd_runtime {
     /* Set while the driver is emitting a resolved hold/tap binding, so the
      * listener ignores the re-entrant position events (mirrors QMK bypass). */
     bool emitting;
+    /* Request the driver to emit the next action synchronously (inline in the
+     * current dispatch) instead of through the async emit work item. Used when
+     * an external keypress forces an undecided state to HOLD: the hold binding
+     * (e.g. a modifier) must be sent BEFORE the external key reaches the keymap,
+     * otherwise the letter is reported without the modifier. */
+    bool sync_emit;
     const struct smtd_config *config;
     /* Owning behavior device, so the driver can reach its config/API. */
     const struct device *device;
@@ -207,6 +213,12 @@ void smtd_apply_event(smtd_runtime *rt, bool is_state_key, smtd_state *state, ui
                       int64_t pressed_time, int64_t released_time, bool event_pressed, uint8_t tap_count);
 
 void smtd_apply_stage(smtd_runtime *rt, smtd_state *state, smtd_stage next_stage);
+
+/* A key that is NOT owned by a state machine pressed while one or more states
+ * are still undecided. Commits undecided states (hold on external keypress)
+ * or drops confirming tap states, without ever adding the external key to the
+ * state pool. */
+void smtd_other_key_down(smtd_runtime *rt, uint32_t position);
 
 void smtd_handle_action(smtd_runtime *rt, smtd_state *state, smtd_action action);
 
